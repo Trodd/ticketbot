@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"regexp"
@@ -1033,6 +1034,14 @@ func (h *Handler) handlePriority(s *discordgo.Session, i *discordgo.InteractionC
 	}
 
 	priorityEmoji := map[string]string{"urgent": "🔴", "high": "🟠", "normal": "🟢", "low": "⚪"}
+
+	// Update channel name with priority dot
+	newChannelName := fmt.Sprintf("%s-%s-%d", priorityEmoji[priority], ticket.Type, ticket.TicketNumber)
+	_, err = s.ChannelEdit(i.ChannelID, &discordgo.ChannelEdit{Name: newChannelName})
+	if err != nil {
+		log.Printf("Failed to rename channel: %v", err)
+	}
+
 	h.respond(s, i, fmt.Sprintf("%s Ticket priority set to **%s**", priorityEmoji[priority], priority), false)
 }
 
@@ -1084,8 +1093,18 @@ func (h *Handler) handleViewNotes(s *discordgo.Session, i *discordgo.Interaction
 
 	var fields []*discordgo.MessageEmbedField
 	for _, note := range notes {
+		// Get the author's display name
+		authorName := note.AuthorID
+		if member, err := s.GuildMember(i.GuildID, note.AuthorID); err == nil && member.User != nil {
+			if member.Nick != "" {
+				authorName = member.Nick
+			} else {
+				authorName = member.User.Username
+			}
+		}
+
 		fields = append(fields, &discordgo.MessageEmbedField{
-			Name:   fmt.Sprintf("<@%s> - <t:%d:R>", note.AuthorID, note.CreatedAt.Unix()),
+			Name:   fmt.Sprintf("%s - <t:%d:R>", authorName, note.CreatedAt.Unix()),
 			Value:  note.Content,
 			Inline: false,
 		})
@@ -1425,7 +1444,36 @@ func (h *Handler) handleDeleteTicket(s *discordgo.Session, i *discordgo.Interact
 				transcript.WriteString(fmt.Sprintf("[%s] %s: %s\n", timestamp, msg.Author.Username, msg.Content))
 			}
 
-			h.db.SaveTranscript(ticket.ID, channelID, guildID, ticket.UserID, transcript.String())
+			transcriptContent := transcript.String()
+			h.db.SaveTranscript(ticket.ID, channelID, guildID, ticket.UserID, transcriptContent)
+
+			// Post transcript to log channel
+			if h.cfg.LogChannelID != "" {
+				embed := &discordgo.MessageEmbed{
+					Title: fmt.Sprintf("📜 Ticket #%d Transcript", ticket.TicketNumber),
+					Color: 0x5865F2,
+					Fields: []*discordgo.MessageEmbedField{
+						{Name: "Type", Value: string(ticket.Type), Inline: true},
+						{Name: "User", Value: fmt.Sprintf("<@%s>", ticket.UserID), Inline: true},
+						{Name: "Subject", Value: ticket.Subject, Inline: false},
+						{Name: "Created", Value: ticket.CreatedAt.Format(time.RFC1123), Inline: true},
+						{Name: "Deleted", Value: time.Now().Format(time.RFC1123), Inline: true},
+					},
+					Footer: &discordgo.MessageEmbedFooter{Text: "Ticket deleted"},
+				}
+
+				// Send transcript as a file attachment
+				filename := fmt.Sprintf("ticket-%d-transcript.txt", ticket.TicketNumber)
+				s.ChannelMessageSendComplex(h.cfg.LogChannelID, &discordgo.MessageSend{
+					Embed: embed,
+					Files: []*discordgo.File{
+						{
+							Name:   filename,
+							Reader: bytes.NewReader([]byte(transcriptContent)),
+						},
+					},
+				})
+			}
 		}
 
 		time.Sleep(2 * time.Second)
