@@ -1,2 +1,27 @@
-/.env
-/tickets.db
+# Environment variables (contains secrets)
+.env
+
+# Database
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go workspace files (local)
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
