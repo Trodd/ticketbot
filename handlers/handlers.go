@@ -39,32 +39,16 @@ func New(cfg *config.Config, db *database.DB) *Handler {
 func (h *Handler) RegisterCommands(s *discordgo.Session) error {
 	commands := []*discordgo.ApplicationCommand{
 		{
-			Name:        "ticket",
-			Description: "Create a new support ticket",
-		},
-		{
-			Name:        "appeal",
-			Description: "Submit a ban/punishment appeal",
-		},
-		{
-			Name:        "apply",
-			Description: "Submit a staff application",
-		},
-		{
-			Name:        "report",
-			Description: "Report a user or issue",
-		},
-		{
 			Name:        "close",
 			Description: "Close the current ticket",
 		},
 		{
 			Name:        "approve",
-			Description: "Approve this appeal/application (Staff only)",
+			Description: "Approve this ticket (Staff only)",
 		},
 		{
 			Name:        "deny",
-			Description: "Deny this appeal/application (Staff only)",
+			Description: "Deny this ticket (Staff only)",
 			Options: []*discordgo.ApplicationCommandOption{
 				{
 					Type:        discordgo.ApplicationCommandOptionString,
@@ -200,6 +184,14 @@ func (h *Handler) RegisterCommands(s *discordgo.Session) error {
 		},
 	}
 
+	// Dynamically add commands for each configured category
+	for _, cat := range h.cfg.Categories {
+		commands = append(commands, &discordgo.ApplicationCommand{
+			Name:        cat.ID,
+			Description: cat.Description,
+		})
+	}
+
 	guildID := h.cfg.GuildID
 
 	// Register commands one by one (more reliable than bulk)
@@ -230,15 +222,16 @@ func (h *Handler) HandleInteraction(s *discordgo.Session, i *discordgo.Interacti
 }
 
 func (h *Handler) handleCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	switch i.ApplicationCommandData().Name {
-	case "ticket":
-		h.showTicketModal(s, i, database.TicketTypeSupport)
-	case "appeal":
-		h.showTicketModal(s, i, database.TicketTypeAppeal)
-	case "apply":
-		h.showTicketModal(s, i, database.TicketTypeApplication)
-	case "report":
-		h.showTicketModal(s, i, database.TicketTypeReport)
+	cmdName := i.ApplicationCommandData().Name
+
+	// Check if it's a dynamic category command
+	if cat := h.cfg.GetCategory(cmdName); cat != nil {
+		h.showTicketModal(s, i, cat.ID)
+		return
+	}
+
+	// Handle built-in commands
+	switch cmdName {
 	case "close":
 		h.handleTicketClose(s, i)
 	case "approve":
@@ -273,15 +266,16 @@ func (h *Handler) handleCommand(s *discordgo.Session, i *discordgo.InteractionCr
 func (h *Handler) handleComponent(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	customID := i.MessageComponentData().CustomID
 
+	// Check for dynamic category button (create_ticket_<categoryID>)
+	if strings.HasPrefix(customID, "create_ticket_") {
+		categoryID := strings.TrimPrefix(customID, "create_ticket_")
+		if cat := h.cfg.GetCategory(categoryID); cat != nil {
+			h.showTicketModal(s, i, cat.ID)
+			return
+		}
+	}
+
 	switch {
-	case customID == "create_ticket_support":
-		h.showTicketModal(s, i, database.TicketTypeSupport)
-	case customID == "create_ticket_appeal":
-		h.showTicketModal(s, i, database.TicketTypeAppeal)
-	case customID == "create_ticket_application":
-		h.showTicketModal(s, i, database.TicketTypeApplication)
-	case customID == "create_ticket_report":
-		h.showTicketModal(s, i, database.TicketTypeReport)
 	case customID == "close_ticket":
 		h.handleTicketClose(s, i)
 	case strings.HasPrefix(customID, "confirm_close_"):
@@ -303,8 +297,8 @@ func (h *Handler) handleModalSubmit(s *discordgo.Session, i *discordgo.Interacti
 	data := i.ModalSubmitData()
 
 	if strings.HasPrefix(data.CustomID, "ticket_modal_") {
-		ticketType := database.TicketType(strings.TrimPrefix(data.CustomID, "ticket_modal_"))
-		h.processTicketModal(s, i, ticketType)
+		categoryID := strings.TrimPrefix(data.CustomID, "ticket_modal_")
+		h.processTicketModal(s, i, categoryID)
 	} else if strings.HasPrefix(data.CustomID, "deny_reason_modal_") {
 		h.processDenyModal(s, i)
 	}
@@ -399,8 +393,15 @@ func (h *Handler) processDenyModal(s *discordgo.Session, i *discordgo.Interactio
 	})
 }
 
-func (h *Handler) showTicketModal(s *discordgo.Session, i *discordgo.InteractionCreate, ticketType database.TicketType) {
+func (h *Handler) showTicketModal(s *discordgo.Session, i *discordgo.InteractionCreate, categoryID string) {
 	userID := h.getUserID(i)
+
+	// Get category config
+	cat := h.cfg.GetCategory(categoryID)
+	if cat == nil {
+		h.respond(s, i, "❌ Unknown ticket category.", true)
+		return
+	}
 
 	// Check blacklist
 	bl, err := h.db.IsBlacklisted(userID, i.GuildID)
@@ -420,185 +421,46 @@ func (h *Handler) showTicketModal(s *discordgo.Session, i *discordgo.Interaction
 		return
 	}
 
-	// Build modal based on ticket type
-	var title string
-	var components []discordgo.MessageComponent
+	// Build modal title
+	title := fmt.Sprintf("%s %s", cat.Emoji, cat.Name)
+	if len(title) > 45 {
+		title = title[:45]
+	}
 
-	switch ticketType {
-	case database.TicketTypeAppeal:
-		title = "🔓 Ban/Punishment Appeal"
-		components = []discordgo.MessageComponent{
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "punishment_type",
-					Label:       "What punishment are you appealing?",
-					Style:       discordgo.TextInputShort,
-					Placeholder: "e.g., Ban, Mute, Kick",
-					Required:    true,
-					MaxLength:   50,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "punishment_reason",
-					Label:       "Why were you punished?",
-					Style:       discordgo.TextInputParagraph,
-					Placeholder: "Describe what you were told the reason was",
-					Required:    true,
-					MaxLength:   500,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "appeal_reason",
-					Label:       "Why should we accept your appeal?",
-					Style:       discordgo.TextInputParagraph,
-					Placeholder: "Explain why you deserve another chance",
-					Required:    true,
-					MaxLength:   1000,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "additional_info",
-					Label:       "Additional Information / Evidence",
-					Style:       discordgo.TextInputParagraph,
-					Placeholder: "Any links, screenshots, or other evidence (optional)",
-					Required:    false,
-					MaxLength:   500,
-				},
-			}},
+	// Build modal components from category fields (max 5 fields for Discord modals)
+	var components []discordgo.MessageComponent
+	for idx, field := range cat.Fields {
+		if idx >= 5 {
+			break // Discord modals support max 5 text inputs
 		}
-	case database.TicketTypeApplication:
-		title = "📝 Staff Application"
-		components = []discordgo.MessageComponent{
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "position",
-					Label:       "What position are you applying for?",
-					Style:       discordgo.TextInputShort,
-					Placeholder: "e.g., Moderator, Helper, Admin",
-					Required:    true,
-					MaxLength:   50,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "experience",
-					Label:       "Relevant Experience",
-					Style:       discordgo.TextInputParagraph,
-					Placeholder: "Describe your past experience...",
-					Required:    true,
-					MaxLength:   1000,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "why_join",
-					Label:       "Why do you want to join our team?",
-					Style:       discordgo.TextInputParagraph,
-					Placeholder: "Tell us why you'd be a good fit",
-					Required:    true,
-					MaxLength:   1000,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "availability",
-					Label:       "Availability (Timezone & Hours)",
-					Style:       discordgo.TextInputShort,
-					Placeholder: "e.g., EST, 4-6 hours daily",
-					Required:    true,
-					MaxLength:   100,
-				},
-			}},
+
+		style := discordgo.TextInputShort
+		if field.Multiline {
+			style = discordgo.TextInputParagraph
 		}
-	case database.TicketTypeReport:
-		title = "🚨 Report"
-		components = []discordgo.MessageComponent{
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "report_type",
-					Label:       "What are you reporting?",
-					Style:       discordgo.TextInputShort,
-					Placeholder: "e.g., User, Bug, Issue",
-					Required:    true,
-					MaxLength:   50,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "reported_user",
-					Label:       "Username/ID of reported user (if applicable)",
-					Style:       discordgo.TextInputShort,
-					Placeholder: "Leave blank if not reporting a user",
-					Required:    false,
-					MaxLength:   100,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "report_details",
-					Label:       "Describe the issue in detail",
-					Style:       discordgo.TextInputParagraph,
-					Placeholder: "Provide as much detail as possible",
-					Required:    true,
-					MaxLength:   1000,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "evidence",
-					Label:       "Evidence Links",
-					Style:       discordgo.TextInputParagraph,
-					Placeholder: "Screenshots, video links, etc.",
-					Required:    false,
-					MaxLength:   500,
-				},
-			}},
+
+		maxLen := field.MaxLength
+		if maxLen == 0 {
+			maxLen = 1000
 		}
-	default: // Support
-		title = "🎫 Support Ticket"
-		components = []discordgo.MessageComponent{
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "subject",
-					Label:       "Subject",
-					Style:       discordgo.TextInputShort,
-					Placeholder: "Brief summary of your issue",
-					Required:    true,
-					MinLength:   3,
-					MaxLength:   100,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "description",
-					Label:       "Description",
-					Style:       discordgo.TextInputParagraph,
-					Placeholder: "Describe your issue in detail",
-					Required:    true,
-					MinLength:   10,
-					MaxLength:   1000,
-				},
-			}},
-			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{
-					CustomID:    "links",
-					Label:       "Related Links (optional)",
-					Style:       discordgo.TextInputParagraph,
-					Placeholder: "Paste any relevant links",
-					Required:    false,
-					MaxLength:   500,
-				},
-			}},
-		}
+
+		components = append(components, discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+			discordgo.TextInput{
+				CustomID:    field.ID,
+				Label:       field.Label,
+				Style:       style,
+				Placeholder: field.Placeholder,
+				Required:    field.Required,
+				MinLength:   field.MinLength,
+				MaxLength:   maxLen,
+			},
+		}})
 	}
 
 	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseModal,
 		Data: &discordgo.InteractionResponseData{
-			CustomID:   "ticket_modal_" + string(ticketType),
+			CustomID:   "ticket_modal_" + categoryID,
 			Title:      title,
 			Components: components,
 		},
@@ -608,8 +470,15 @@ func (h *Handler) showTicketModal(s *discordgo.Session, i *discordgo.Interaction
 	}
 }
 
-func (h *Handler) processTicketModal(s *discordgo.Session, i *discordgo.InteractionCreate, ticketType database.TicketType) {
+func (h *Handler) processTicketModal(s *discordgo.Session, i *discordgo.InteractionCreate, categoryID string) {
 	userID := h.getUserID(i)
+
+	// Get category config
+	cat := h.cfg.GetCategory(categoryID)
+	if cat == nil {
+		h.respond(s, i, "❌ Unknown ticket category.", true)
+		return
+	}
 
 	// Extract form data
 	formData := make(map[string]string)
@@ -623,17 +492,13 @@ func (h *Handler) processTicketModal(s *discordgo.Session, i *discordgo.Interact
 		}
 	}
 
-	// Determine subject based on ticket type
+	// Determine subject - use first field value or category name
 	var subject string
-	switch ticketType {
-	case database.TicketTypeAppeal:
-		subject = "Appeal: " + formData["punishment_type"]
-	case database.TicketTypeApplication:
-		subject = "Application: " + formData["position"]
-	case database.TicketTypeReport:
-		subject = "Report: " + formData["report_type"]
-	default:
-		subject = formData["subject"]
+	if len(cat.Fields) > 0 {
+		firstFieldID := cat.Fields[0].ID
+		subject = fmt.Sprintf("%s: %s", cat.Name, formData[firstFieldID])
+	} else {
+		subject = cat.Name
 	}
 
 	// Defer response
@@ -643,15 +508,18 @@ func (h *Handler) processTicketModal(s *discordgo.Session, i *discordgo.Interact
 	})
 
 	// Get next ticket number for this type
-	nextNum := h.db.GetNextTicketNumberByType(i.GuildID, ticketType)
+	nextNum := h.db.GetNextTicketNumberByType(i.GuildID, database.TicketType(categoryID))
 
 	// Create channel with type-specific naming
-	channelName := fmt.Sprintf("%s-%d", ticketType, nextNum)
+	channelName := fmt.Sprintf("%s-%d", categoryID, nextNum)
 
+	// Build permission overwrites
 	overwrites := []*discordgo.PermissionOverwrite{
 		{ID: i.GuildID, Type: discordgo.PermissionOverwriteTypeRole, Deny: discordgo.PermissionViewChannel},
 		{ID: userID, Type: discordgo.PermissionOverwriteTypeMember, Allow: discordgo.PermissionViewChannel | discordgo.PermissionSendMessages | discordgo.PermissionReadMessageHistory},
 	}
+
+	// Add support role
 	if h.cfg.SupportRoleID != "" {
 		overwrites = append(overwrites, &discordgo.PermissionOverwrite{
 			ID: h.cfg.SupportRoleID, Type: discordgo.PermissionOverwriteTypeRole,
@@ -659,13 +527,23 @@ func (h *Handler) processTicketModal(s *discordgo.Session, i *discordgo.Interact
 		})
 	}
 
+	// Add category-specific allowed roles
+	for _, roleID := range cat.AllowedRoles {
+		if roleID != "" && roleID != h.cfg.SupportRoleID {
+			overwrites = append(overwrites, &discordgo.PermissionOverwrite{
+				ID: roleID, Type: discordgo.PermissionOverwriteTypeRole,
+				Allow: discordgo.PermissionViewChannel | discordgo.PermissionSendMessages | discordgo.PermissionReadMessageHistory,
+			})
+		}
+	}
+
 	channelData := discordgo.GuildChannelCreateData{
 		Name:                 channelName,
 		Type:                 discordgo.ChannelTypeGuildText,
 		PermissionOverwrites: overwrites,
 	}
-	if h.cfg.TicketCategory != "" {
-		channelData.ParentID = h.cfg.TicketCategory
+	if h.cfg.TicketCategoryID != "" {
+		channelData.ParentID = h.cfg.TicketCategoryID
 	}
 
 	channel, err := s.GuildChannelCreateComplex(i.GuildID, channelData)
@@ -675,20 +553,16 @@ func (h *Handler) processTicketModal(s *discordgo.Session, i *discordgo.Interact
 		return
 	}
 
-	// Get description for database
-	description := formData["description"]
-	if description == "" {
-		description = formData["appeal_reason"]
-	}
-	if description == "" {
-		description = formData["report_details"]
-	}
-	if description == "" {
-		description = formData["experience"]
+	// Get description for database - use second field or first field
+	var description string
+	if len(cat.Fields) > 1 {
+		description = formData[cat.Fields[1].ID]
+	} else if len(cat.Fields) > 0 {
+		description = formData[cat.Fields[0].ID]
 	}
 
 	// Save ticket
-	ticket, err := h.db.CreateTicket(channel.ID, userID, i.GuildID, ticketType, subject, description, formData)
+	ticket, err := h.db.CreateTicket(channel.ID, userID, i.GuildID, database.TicketType(categoryID), subject, description, formData)
 	if err != nil {
 		s.ChannelDelete(channel.ID)
 		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: stringPtr("Failed to save ticket.")})
@@ -699,14 +573,14 @@ func (h *Handler) processTicketModal(s *discordgo.Session, i *discordgo.Interact
 	// Build action buttons
 	var buttons []discordgo.MessageComponent
 
-	if ticketType == database.TicketTypeAppeal || ticketType == database.TicketTypeApplication {
+	if cat.HasApproval {
 		buttons = append(buttons, discordgo.Button{Label: "Approve", Style: discordgo.SuccessButton, CustomID: "approve_" + channel.ID, Emoji: &discordgo.ComponentEmoji{Name: "✅"}})
 		buttons = append(buttons, discordgo.Button{Label: "Deny", Style: discordgo.DangerButton, CustomID: "deny_" + channel.ID, Emoji: &discordgo.ComponentEmoji{Name: "❌"}})
 	}
 	buttons = append(buttons, discordgo.Button{Label: "Close", Style: discordgo.SecondaryButton, CustomID: "close_ticket", Emoji: &discordgo.ComponentEmoji{Name: "🔒"}})
 
 	// Build Components v2 message
-	components := h.buildTicketComponentsV2(ticket, ticketType, userID, formData, buttons, "")
+	components := h.buildTicketComponentsV2(ticket, cat, userID, formData, buttons, "")
 
 	// Send the Components v2 ticket message (mentions user in the component)
 	s.ChannelMessageSendComplex(channel.ID, &discordgo.MessageSend{
@@ -715,13 +589,15 @@ func (h *Handler) processTicketModal(s *discordgo.Session, i *discordgo.Interact
 	})
 
 	// Send media links using Components v2 - MediaGallery for images, video links separately
-	links := formData["links"]
-	if links == "" {
-		links = formData["evidence"]
+	// Look for any field that might contain links
+	var links string
+	for _, val := range formData {
+		foundURLs := urlRegex.FindAllString(val, -1)
+		if len(foundURLs) > 0 {
+			links += " " + val
+		}
 	}
-	if links == "" {
-		links = formData["additional_info"]
-	}
+
 	if links != "" {
 		allURLs := urlRegex.FindAllString(links, -1)
 		var imageItems []discordgo.MediaGalleryItem
@@ -761,61 +637,32 @@ func (h *Handler) processTicketModal(s *discordgo.Session, i *discordgo.Interact
 	// Transcript will be auto-logged when ticket is closed
 
 	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Content: stringPtr(fmt.Sprintf("✅ Your %s ticket has been created: <#%s>", ticketType, channel.ID)),
+		Content: stringPtr(fmt.Sprintf("✅ Your %s ticket has been created: <#%s>", cat.Name, channel.ID)),
 	})
 }
 
-func (h *Handler) buildTicketEmbed(ticket *database.Ticket, ticketType database.TicketType, userID string, formData map[string]string) *discordgo.MessageEmbed {
-	var title, emoji string
-	var color int
+func (h *Handler) buildTicketEmbed(ticket *database.Ticket, cat *config.TicketCategory, userID string, formData map[string]string) *discordgo.MessageEmbed {
 	var fields []*discordgo.MessageEmbedField
 
-	switch ticketType {
-	case database.TicketTypeAppeal:
-		emoji, title, color = "🔓", "Ban/Punishment Appeal", 0xFFA500
-		fields = []*discordgo.MessageEmbedField{
-			{Name: "Ticket ID", Value: fmt.Sprintf("#%d", ticket.TicketNumber), Inline: true},
-			{Name: "User", Value: fmt.Sprintf("<@%s>", userID), Inline: true},
-			{Name: "Status", Value: "🟡 Pending Review", Inline: true},
-			{Name: "Punishment Type", Value: formData["punishment_type"], Inline: false},
-			{Name: "Original Reason", Value: formData["punishment_reason"], Inline: false},
-			{Name: "Appeal Reason", Value: formData["appeal_reason"], Inline: false},
-		}
-	case database.TicketTypeApplication:
-		emoji, title, color = "📝", "Staff Application", 0x9B59B6
-		fields = []*discordgo.MessageEmbedField{
-			{Name: "Ticket ID", Value: fmt.Sprintf("#%d", ticket.TicketNumber), Inline: true},
-			{Name: "Applicant", Value: fmt.Sprintf("<@%s>", userID), Inline: true},
-			{Name: "Position", Value: formData["position"], Inline: true},
-			{Name: "Experience", Value: truncate(formData["experience"], 1000), Inline: false},
-			{Name: "Why Join?", Value: truncate(formData["why_join"], 1000), Inline: false},
-			{Name: "Availability", Value: formData["availability"], Inline: false},
-		}
-	case database.TicketTypeReport:
-		emoji, title, color = "🚨", "Report", 0xE74C3C
-		fields = []*discordgo.MessageEmbedField{
-			{Name: "Ticket ID", Value: fmt.Sprintf("#%d", ticket.TicketNumber), Inline: true},
-			{Name: "Reporter", Value: fmt.Sprintf("<@%s>", userID), Inline: true},
-			{Name: "Report Type", Value: formData["report_type"], Inline: true},
-			{Name: "Details", Value: truncate(formData["report_details"], 1000), Inline: false},
-		}
-		if formData["reported_user"] != "" {
-			fields = append(fields, &discordgo.MessageEmbedField{Name: "Reported User", Value: formData["reported_user"], Inline: false})
-		}
-	default:
-		emoji, title, color = "🎫", "Support Ticket", 0x5865F2
-		fields = []*discordgo.MessageEmbedField{
-			{Name: "Ticket ID", Value: fmt.Sprintf("#%d", ticket.TicketNumber), Inline: true},
-			{Name: "User", Value: fmt.Sprintf("<@%s>", userID), Inline: true},
-			{Name: "Created", Value: fmt.Sprintf("<t:%d:R>", time.Now().Unix()), Inline: true},
-			{Name: "Subject", Value: ticket.Subject, Inline: false},
-			{Name: "Description", Value: truncate(formData["description"], 1000), Inline: false},
+	// Add standard fields
+	fields = append(fields, &discordgo.MessageEmbedField{Name: "Ticket ID", Value: fmt.Sprintf("#%d", ticket.TicketNumber), Inline: true})
+	fields = append(fields, &discordgo.MessageEmbedField{Name: "User", Value: fmt.Sprintf("<@%s>", userID), Inline: true})
+	fields = append(fields, &discordgo.MessageEmbedField{Name: "Status", Value: "🟡 Pending", Inline: true})
+
+	// Add dynamic fields from form data
+	for _, field := range cat.Fields {
+		if val, ok := formData[field.ID]; ok && val != "" {
+			fields = append(fields, &discordgo.MessageEmbedField{
+				Name:   field.Label,
+				Value:  truncate(val, 1000),
+				Inline: false,
+			})
 		}
 	}
 
 	return &discordgo.MessageEmbed{
-		Title:  fmt.Sprintf("%s %s", emoji, title),
-		Color:  color,
+		Title:  fmt.Sprintf("%s %s", cat.Emoji, cat.Name),
+		Color:  cat.Color,
 		Fields: fields,
 		Footer: &discordgo.MessageEmbedFooter{Text: "Staff: Use the buttons to manage this ticket"},
 	}
@@ -823,79 +670,36 @@ func (h *Handler) buildTicketEmbed(ticket *database.Ticket, ticketType database.
 
 // buildTicketComponentsV2 creates Components v2 layout for ticket messages
 // statusOverride can be empty for default, or contain status text like "✅ APPROVED" or "❌ DENIED"
-func (h *Handler) buildTicketComponentsV2(ticket *database.Ticket, ticketType database.TicketType, userID string, formData map[string]string, buttons []discordgo.MessageComponent, statusOverride string) []discordgo.MessageComponent {
-	var title, emoji string
-	var color int
-	var contentParts []discordgo.MessageComponent
+func (h *Handler) buildTicketComponentsV2(ticket *database.Ticket, cat *config.TicketCategory, userID string, formData map[string]string, buttons []discordgo.MessageComponent, statusOverride string) []discordgo.MessageComponent {
 	dividerTrue := true
 	spacingSmall := discordgo.SeparatorSpacingSizeSmall
 
-	// Determine status display
-	statusText := "🟡 Pending Review"
+	// Determine status display and color
+	statusText := "🟡 Pending"
+	color := cat.Color
 	if statusOverride != "" {
 		statusText = statusOverride
+		if strings.Contains(statusOverride, "APPROVED") {
+			color = 0x57F287
+		} else if strings.Contains(statusOverride, "DENIED") {
+			color = 0xED4245
+		} else if strings.Contains(statusOverride, "Closed") {
+			color = 0x95A5A6
+		}
 	}
 
-	switch ticketType {
-	case database.TicketTypeAppeal:
-		emoji, title, color = "🔓", "Ban/Punishment Appeal", 0xFFA500
-		if strings.Contains(statusOverride, "APPROVED") {
-			color = 0x57F287
-		} else if strings.Contains(statusOverride, "DENIED") {
-			color = 0xED4245
-		} else if strings.Contains(statusOverride, "Closed") {
-			color = 0x95A5A6
-		}
-		contentParts = []discordgo.MessageComponent{
-			discordgo.TextDisplay{Content: fmt.Sprintf("# %s %s", emoji, title)},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Ticket ID:** #%d  •  **User:** <@%s>  •  **Status:** %s", ticket.TicketNumber, userID, statusText)},
-			discordgo.Separator{Divider: &dividerTrue, Spacing: &spacingSmall},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Punishment Type:**\n%s", formData["punishment_type"])},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Original Reason:**\n%s", formData["punishment_reason"])},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Appeal Reason:**\n%s", truncate(formData["appeal_reason"], 1000))},
-		}
-	case database.TicketTypeApplication:
-		emoji, title, color = "📝", "Staff Application", 0x9B59B6
-		if strings.Contains(statusOverride, "APPROVED") {
-			color = 0x57F287
-		} else if strings.Contains(statusOverride, "DENIED") {
-			color = 0xED4245
-		} else if strings.Contains(statusOverride, "Closed") {
-			color = 0x95A5A6
-		}
-		contentParts = []discordgo.MessageComponent{
-			discordgo.TextDisplay{Content: fmt.Sprintf("# %s %s", emoji, title)},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Ticket ID:** #%d  •  **Applicant:** <@%s>  •  **Position:** %s  •  **Status:** %s", ticket.TicketNumber, userID, formData["position"], statusText)},
-			discordgo.Separator{Divider: &dividerTrue, Spacing: &spacingSmall},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Experience:**\n%s", truncate(formData["experience"], 1000))},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Why Join?**\n%s", truncate(formData["why_join"], 1000))},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Availability:**\n%s", formData["availability"])},
-		}
-	case database.TicketTypeReport:
-		emoji, title, color = "🚨", "Report", 0xE74C3C
-		if strings.Contains(statusOverride, "Closed") {
-			color = 0x95A5A6
-		}
-		contentParts = []discordgo.MessageComponent{
-			discordgo.TextDisplay{Content: fmt.Sprintf("# %s %s", emoji, title)},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Ticket ID:** #%d  •  **Reporter:** <@%s>  •  **Type:** %s  •  **Status:** %s", ticket.TicketNumber, userID, formData["report_type"], statusText)},
-			discordgo.Separator{Divider: &dividerTrue, Spacing: &spacingSmall},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Details:**\n%s", truncate(formData["report_details"], 1000))},
-		}
-		if formData["reported_user"] != "" {
-			contentParts = append(contentParts, discordgo.TextDisplay{Content: fmt.Sprintf("**Reported User:** %s", formData["reported_user"])})
-		}
-	default:
-		emoji, title, color = "🎫", "Support Ticket", 0x5865F2
-		if strings.Contains(statusOverride, "Closed") {
-			color = 0x95A5A6
-		}
-		contentParts = []discordgo.MessageComponent{
-			discordgo.TextDisplay{Content: fmt.Sprintf("# %s %s", emoji, title)},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Ticket ID:** #%d  •  **User:** <@%s>  •  **Created:** <t:%d:R>  •  **Status:** %s", ticket.TicketNumber, userID, ticket.CreatedAt.Unix(), statusText)},
-			discordgo.Separator{Divider: &dividerTrue, Spacing: &spacingSmall},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Subject:** %s", ticket.Subject)},
-			discordgo.TextDisplay{Content: fmt.Sprintf("**Description:**\n%s", truncate(formData["description"], 1000))},
+	// Build content parts
+	var contentParts []discordgo.MessageComponent
+
+	// Header
+	contentParts = append(contentParts, discordgo.TextDisplay{Content: fmt.Sprintf("# %s %s", cat.Emoji, cat.Name)})
+	contentParts = append(contentParts, discordgo.TextDisplay{Content: fmt.Sprintf("**Ticket ID:** #%d  •  **User:** <@%s>  •  **Created:** <t:%d:R>  •  **Status:** %s", ticket.TicketNumber, userID, ticket.CreatedAt.Unix(), statusText)})
+	contentParts = append(contentParts, discordgo.Separator{Divider: &dividerTrue, Spacing: &spacingSmall})
+
+	// Dynamic fields from form data
+	for _, field := range cat.Fields {
+		if val, ok := formData[field.ID]; ok && val != "" {
+			contentParts = append(contentParts, discordgo.TextDisplay{Content: fmt.Sprintf("**%s:**\n%s", field.Label, truncate(val, 1000))})
 		}
 	}
 
@@ -924,8 +728,10 @@ func (h *Handler) handleApprove(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	if ticket.Type != database.TicketTypeAppeal && ticket.Type != database.TicketTypeApplication {
-		h.respond(s, i, "This command is only for appeals and applications.", true)
+	// Check if category supports approval workflow
+	cat := h.cfg.GetCategory(string(ticket.Type))
+	if cat == nil || !cat.HasApproval {
+		h.respond(s, i, "This ticket type does not support approval workflow.", true)
 		return
 	}
 
@@ -1286,6 +1092,12 @@ func (h *Handler) handleTicketClose(s *discordgo.Session, i *discordgo.Interacti
 		return
 	}
 
+	// Get category for this ticket
+	cat := h.cfg.GetCategory(string(ticket.Type))
+	if cat == nil {
+		cat = &config.TicketCategory{ID: string(ticket.Type), Name: string(ticket.Type), Emoji: "🎫", Color: 0x5865F2}
+	}
+
 	// Build confirmation buttons
 	buttons := []discordgo.MessageComponent{
 		discordgo.Button{Label: "Confirm Close", Style: discordgo.DangerButton, CustomID: fmt.Sprintf("confirm_close_%s", i.ChannelID), Emoji: &discordgo.ComponentEmoji{Name: "✅"}},
@@ -1294,7 +1106,7 @@ func (h *Handler) handleTicketClose(s *discordgo.Session, i *discordgo.Interacti
 
 	// Update the message with confirmation prompt while preserving ticket info
 	statusText := "⚠️ Confirm close? Non-staff will be removed"
-	components := h.buildTicketComponentsV2(ticket, ticket.Type, ticket.UserID, ticket.FormData, buttons, statusText)
+	components := h.buildTicketComponentsV2(ticket, cat, ticket.UserID, ticket.FormData, buttons, statusText)
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
@@ -1333,6 +1145,12 @@ func (h *Handler) handleConfirmClose(s *discordgo.Session, i *discordgo.Interact
 		}
 	}
 
+	// Get category for this ticket
+	cat := h.cfg.GetCategory(string(ticket.Type))
+	if cat == nil {
+		cat = &config.TicketCategory{ID: string(ticket.Type), Name: string(ticket.Type), Emoji: "🎫", Color: 0x5865F2}
+	}
+
 	// Build reopen/delete buttons
 	buttons := []discordgo.MessageComponent{
 		discordgo.Button{Label: "Reopen Ticket", Style: discordgo.SuccessButton, CustomID: "reopen_ticket", Emoji: &discordgo.ComponentEmoji{Name: "🔓"}},
@@ -1341,7 +1159,7 @@ func (h *Handler) handleConfirmClose(s *discordgo.Session, i *discordgo.Interact
 
 	// Update message with closed status while preserving ticket info
 	statusText := fmt.Sprintf("🔒 Closed by <@%s>", closerID)
-	components := h.buildTicketComponentsV2(ticket, ticket.Type, ticket.UserID, ticket.FormData, buttons, statusText)
+	components := h.buildTicketComponentsV2(ticket, cat, ticket.UserID, ticket.FormData, buttons, statusText)
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
@@ -1377,9 +1195,15 @@ func (h *Handler) handleReopenTicket(s *discordgo.Session, i *discordgo.Interact
 
 	staffID := h.getUserID(i)
 
+	// Get category for this ticket
+	cat := h.cfg.GetCategory(string(ticket.Type))
+	if cat == nil {
+		cat = &config.TicketCategory{ID: string(ticket.Type), Name: string(ticket.Type), Emoji: "🎫", Color: 0x5865F2}
+	}
+
 	// Build buttons based on ticket type
 	var buttons []discordgo.MessageComponent
-	if ticket.Type == database.TicketTypeAppeal || ticket.Type == database.TicketTypeApplication {
+	if cat.HasApproval {
 		buttons = append(buttons, discordgo.Button{Label: "Approve", Style: discordgo.SuccessButton, CustomID: "approve_" + i.ChannelID, Emoji: &discordgo.ComponentEmoji{Name: "✅"}})
 		buttons = append(buttons, discordgo.Button{Label: "Deny", Style: discordgo.DangerButton, CustomID: "deny_" + i.ChannelID, Emoji: &discordgo.ComponentEmoji{Name: "❌"}})
 	}
@@ -1387,7 +1211,7 @@ func (h *Handler) handleReopenTicket(s *discordgo.Session, i *discordgo.Interact
 
 	// Update message with reopened status while preserving ticket info
 	statusText := fmt.Sprintf("🔓 Reopened by <@%s>", staffID)
-	components := h.buildTicketComponentsV2(ticket, ticket.Type, ticket.UserID, ticket.FormData, buttons, statusText)
+	components := h.buildTicketComponentsV2(ticket, cat, ticket.UserID, ticket.FormData, buttons, statusText)
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
@@ -1413,9 +1237,15 @@ func (h *Handler) handleDeleteTicket(s *discordgo.Session, i *discordgo.Interact
 	channelID := i.ChannelID
 	guildID := i.GuildID
 
+	// Get category for this ticket
+	cat := h.cfg.GetCategory(string(ticket.Type))
+	if cat == nil {
+		cat = &config.TicketCategory{ID: string(ticket.Type), Name: string(ticket.Type), Emoji: "🎫", Color: 0x5865F2}
+	}
+
 	// Update message with deleting status while preserving ticket info
 	statusText := "🗑️ Saving transcript and deleting..."
-	components := h.buildTicketComponentsV2(ticket, ticket.Type, ticket.UserID, ticket.FormData, []discordgo.MessageComponent{}, statusText)
+	components := h.buildTicketComponentsV2(ticket, cat, ticket.UserID, ticket.FormData, []discordgo.MessageComponent{}, statusText)
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
@@ -1488,16 +1318,22 @@ func (h *Handler) handleCancelClose(s *discordgo.Session, i *discordgo.Interacti
 		return
 	}
 
+	// Get category for this ticket
+	cat := h.cfg.GetCategory(string(ticket.Type))
+	if cat == nil {
+		cat = &config.TicketCategory{ID: string(ticket.Type), Name: string(ticket.Type), Emoji: "🎫", Color: 0x5865F2}
+	}
+
 	// Restore original buttons based on ticket type and status
 	var buttons []discordgo.MessageComponent
-	if (ticket.Type == database.TicketTypeAppeal || ticket.Type == database.TicketTypeApplication) && ticket.Status == database.StatusOpen {
+	if cat.HasApproval && ticket.Status == database.StatusOpen {
 		buttons = append(buttons, discordgo.Button{Label: "Approve", Style: discordgo.SuccessButton, CustomID: "approve_" + i.ChannelID, Emoji: &discordgo.ComponentEmoji{Name: "✅"}})
 		buttons = append(buttons, discordgo.Button{Label: "Deny", Style: discordgo.DangerButton, CustomID: "deny_" + i.ChannelID, Emoji: &discordgo.ComponentEmoji{Name: "❌"}})
 	}
 	buttons = append(buttons, discordgo.Button{Label: "Close", Style: discordgo.SecondaryButton, CustomID: "close_ticket", Emoji: &discordgo.ComponentEmoji{Name: "🔒"}})
 
 	// Restore original ticket view with default status
-	components := h.buildTicketComponentsV2(ticket, ticket.Type, ticket.UserID, ticket.FormData, buttons, "")
+	components := h.buildTicketComponentsV2(ticket, cat, ticket.UserID, ticket.FormData, buttons, "")
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
@@ -1520,51 +1356,50 @@ func (h *Handler) handleTicketPanel(s *discordgo.Session, i *discordgo.Interacti
 	dividerTrue := true
 	spacingLarge := discordgo.SeparatorSpacingSizeLarge
 
+	// Build container components
+	containerComponents := []discordgo.MessageComponent{
+		// Header section
+		discordgo.TextDisplay{Content: "# 🎫 Support Center"},
+		discordgo.TextDisplay{Content: "Select the type of ticket you need to create below."},
+		// Separator
+		discordgo.Separator{Divider: &dividerTrue, Spacing: &spacingLarge},
+	}
+
+	// Dynamically add sections for each configured category
+	buttonStyles := []discordgo.ButtonStyle{
+		discordgo.PrimaryButton,
+		discordgo.SecondaryButton,
+		discordgo.SuccessButton,
+		discordgo.DangerButton,
+	}
+
+	for idx, cat := range h.cfg.Categories {
+		style := buttonStyles[idx%len(buttonStyles)]
+		section := discordgo.Section{
+			Accessory: discordgo.Button{
+				Label:    cat.Name,
+				Style:    style,
+				CustomID: "create_ticket_" + cat.ID,
+				Emoji:    &discordgo.ComponentEmoji{Name: cat.Emoji},
+			},
+			Components: []discordgo.MessageComponent{
+				discordgo.TextDisplay{Content: fmt.Sprintf("**%s %s**\n%s", cat.Emoji, cat.Name, cat.Description)},
+			},
+		}
+		containerComponents = append(containerComponents, section)
+	}
+
 	s.ChannelMessageSendComplex(i.ChannelID, &discordgo.MessageSend{
 		Flags: discordgo.MessageFlagsIsComponentsV2,
 		Components: []discordgo.MessageComponent{
-			// Main container with accent color
 			discordgo.Container{
 				AccentColor: &accentColor,
-				Components: []discordgo.MessageComponent{
-					// Header section
-					discordgo.TextDisplay{Content: "# 🎫 Support Center"},
-					discordgo.TextDisplay{Content: "Select the type of ticket you need to create below."},
-
-					// Separator
-					discordgo.Separator{Divider: &dividerTrue, Spacing: &spacingLarge},
-
-					// Ticket type descriptions using Sections
-					discordgo.Section{
-						Accessory: discordgo.Button{Label: "Support", Style: discordgo.PrimaryButton, CustomID: "create_ticket_support", Emoji: &discordgo.ComponentEmoji{Name: "🎫"}},
-						Components: []discordgo.MessageComponent{
-							discordgo.TextDisplay{Content: "**🎫 Support Ticket**\nGeneral questions, help requests, and inquiries"},
-						},
-					},
-					discordgo.Section{
-						Accessory: discordgo.Button{Label: "Appeal", Style: discordgo.SecondaryButton, CustomID: "create_ticket_appeal", Emoji: &discordgo.ComponentEmoji{Name: "🔓"}},
-						Components: []discordgo.MessageComponent{
-							discordgo.TextDisplay{Content: "**🔓 Ban Appeal**\nAppeal a ban, mute, or other punishment"},
-						},
-					},
-					discordgo.Section{
-						Accessory: discordgo.Button{Label: "Apply", Style: discordgo.SuccessButton, CustomID: "create_ticket_application", Emoji: &discordgo.ComponentEmoji{Name: "📝"}},
-						Components: []discordgo.MessageComponent{
-							discordgo.TextDisplay{Content: "**📝 Staff Application**\nApply to join the staff team"},
-						},
-					},
-					discordgo.Section{
-						Accessory: discordgo.Button{Label: "Report", Style: discordgo.DangerButton, CustomID: "create_ticket_report", Emoji: &discordgo.ComponentEmoji{Name: "🚨"}},
-						Components: []discordgo.MessageComponent{
-							discordgo.TextDisplay{Content: "**🚨 Report**\nReport a user, bug, or other issue"},
-						},
-					},
-				},
+				Components:  containerComponents,
 			},
 		},
 	})
 
-	h.respond(s, i, "✅ Ticket panel created with Components v2!", true)
+	h.respond(s, i, "✅ Ticket panel created!", true)
 }
 
 func (h *Handler) handleTicketStats(s *discordgo.Session, i *discordgo.InteractionCreate) {
