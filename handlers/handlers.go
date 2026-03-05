@@ -265,6 +265,7 @@ func (h *Handler) handleCommand(s *discordgo.Session, i *discordgo.InteractionCr
 
 func (h *Handler) handleComponent(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	customID := i.MessageComponentData().CustomID
+	log.Printf("Component interaction received: customID=%s, channelID=%s", customID, i.ChannelID)
 
 	// Check for dynamic category button (create_ticket_<categoryID>)
 	if strings.HasPrefix(customID, "create_ticket_") {
@@ -287,9 +288,13 @@ func (h *Handler) handleComponent(s *discordgo.Session, i *discordgo.Interaction
 	case customID == "delete_ticket":
 		h.handleDeleteTicket(s, i)
 	case strings.HasPrefix(customID, "approve_"):
+		log.Printf("Routing to handleApprove")
 		h.handleApprove(s, i)
 	case strings.HasPrefix(customID, "deny_"):
+		log.Printf("Routing to showDenyModal")
 		h.showDenyModal(s, i)
+	default:
+		log.Printf("No handler found for customID: %s", customID)
 	}
 }
 
@@ -305,7 +310,10 @@ func (h *Handler) handleModalSubmit(s *discordgo.Session, i *discordgo.Interacti
 }
 
 func (h *Handler) showDenyModal(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	log.Printf("showDenyModal called, channelID: %s", i.ChannelID)
+	
 	if !h.isStaff(i) {
+		log.Printf("showDenyModal: user is not staff")
 		h.respond(s, i, "❌ Only staff members can deny tickets.", true)
 		return
 	}
@@ -315,6 +323,7 @@ func (h *Handler) showDenyModal(s *discordgo.Session, i *discordgo.InteractionCr
 	if i.Message != nil {
 		messageID = i.Message.ID
 	}
+	log.Printf("showDenyModal: showing modal with messageID=%s", messageID)
 
 	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseModal,
@@ -339,7 +348,9 @@ func (h *Handler) showDenyModal(s *discordgo.Session, i *discordgo.InteractionCr
 		},
 	})
 	if err != nil {
-		log.Printf("Failed to show deny modal: %v", err)
+		log.Printf("showDenyModal: failed to show modal: %v", err)
+	} else {
+		log.Printf("showDenyModal: modal shown successfully")
 	}
 }
 
@@ -362,9 +373,18 @@ func (h *Handler) processDenyModal(s *discordgo.Session, i *discordgo.Interactio
 		return
 	}
 
+	// Acknowledge modal submission after validation
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredMessageUpdate,
+	})
+
 	staffID := h.getUserID(i)
 	if err := h.db.DenyTicket(i.ChannelID, staffID); err != nil {
-		h.respondError(s, i, "Failed to deny ticket")
+		// Use followup since we already acknowledged
+		s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+			Content: "❌ Failed to deny ticket",
+			Flags:   discordgo.MessageFlagsEphemeral,
+		})
 		return
 	}
 
@@ -373,7 +393,7 @@ func (h *Handler) processDenyModal(s *discordgo.Session, i *discordgo.Interactio
 	container := discordgo.Container{
 		AccentColor: &denyColor,
 		Components: []discordgo.MessageComponent{
-			discordgo.TextDisplay{Content: fmt.Sprintf("# ❌ Ticket Denied\n\n**Staff:** <@%s>\n**Reason:** %s", staffID, reason)},
+			discordgo.TextDisplay{Content: fmt.Sprintf("# ❌ Ticket Denied\n\n<@%s> Your ticket has been denied.\n\n**Staff:** <@%s>\n**Reason:** %s", ticket.UserID, staffID, reason)},
 			discordgo.Separator{},
 			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
 				discordgo.Button{Label: "Close", Style: discordgo.SecondaryButton, CustomID: "close_ticket", Emoji: &discordgo.ComponentEmoji{Name: "🔒"}},
@@ -382,14 +402,8 @@ func (h *Handler) processDenyModal(s *discordgo.Session, i *discordgo.Interactio
 	}
 
 	s.ChannelMessageSendComplex(i.ChannelID, &discordgo.MessageSend{
-		Content:    fmt.Sprintf("<@%s>", ticket.UserID),
 		Flags:      discordgo.MessageFlagsIsComponentsV2,
 		Components: []discordgo.MessageComponent{container},
-	})
-
-	// Acknowledge the modal silently
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredMessageUpdate,
 	})
 }
 
@@ -717,36 +731,66 @@ func (h *Handler) buildTicketComponentsV2(ticket *database.Ticket, cat *config.T
 }
 
 func (h *Handler) handleApprove(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	log.Printf("handleApprove called, interaction type: %v, channelID: %s", i.Type, i.ChannelID)
+	
 	if !h.isStaff(i) {
+		log.Printf("handleApprove: user is not staff")
 		h.respond(s, i, "❌ Only staff members can approve tickets.", true)
 		return
 	}
 
 	ticket, err := h.db.GetTicketByChannel(i.ChannelID)
 	if err != nil || ticket == nil {
+		log.Printf("handleApprove: ticket not found, err=%v, ticket=%v", err, ticket)
 		h.respond(s, i, "This command can only be used in a ticket channel.", true)
 		return
 	}
+	log.Printf("handleApprove: found ticket #%d, type=%s", ticket.TicketNumber, ticket.Type)
 
 	// Check if category supports approval workflow
 	cat := h.cfg.GetCategory(string(ticket.Type))
 	if cat == nil || !cat.HasApproval {
+		log.Printf("handleApprove: category %s doesn't support approval (cat=%v)", ticket.Type, cat)
 		h.respond(s, i, "This ticket type does not support approval workflow.", true)
 		return
 	}
+	log.Printf("handleApprove: category %s has approval, proceeding", cat.ID)
+
+	// Acknowledge button click immediately for component interactions (after validation)
+	if i.Type == discordgo.InteractionMessageComponent {
+		err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseDeferredMessageUpdate,
+		})
+		if err != nil {
+			log.Printf("handleApprove: failed to acknowledge interaction: %v", err)
+		} else {
+			log.Printf("handleApprove: interaction acknowledged successfully")
+		}
+	}
 
 	staffID := h.getUserID(i)
+	log.Printf("handleApprove: calling ApproveTicket for channel %s, staffID %s", i.ChannelID, staffID)
 	if err := h.db.ApproveTicket(i.ChannelID, staffID); err != nil {
-		h.respondError(s, i, "Failed to approve ticket")
+		log.Printf("handleApprove: ApproveTicket failed: %v", err)
+		if i.Type == discordgo.InteractionMessageComponent {
+			// Use followup since we already acknowledged
+			s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+				Content: "❌ Failed to approve ticket",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			})
+		} else {
+			h.respondError(s, i, "Failed to approve ticket")
+		}
 		return
 	}
+	log.Printf("handleApprove: ApproveTicket succeeded")
 
 	// Send approval notification as a new message (keep original ticket embed)
 	approveColor := 0x57F287
 	container := discordgo.Container{
 		AccentColor: &approveColor,
 		Components: []discordgo.MessageComponent{
-			discordgo.TextDisplay{Content: fmt.Sprintf("# ✅ Ticket Approved\n\n**Staff:** <@%s>", staffID)},
+			discordgo.TextDisplay{Content: fmt.Sprintf("# ✅ Ticket Approved\n\n<@%s> Your ticket has been approved!\n\n**Staff:** <@%s>", ticket.UserID, staffID)},
 			discordgo.Separator{},
 			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
 				discordgo.Button{Label: "Close", Style: discordgo.SecondaryButton, CustomID: "close_ticket", Emoji: &discordgo.ComponentEmoji{Name: "🔒"}},
@@ -754,17 +798,21 @@ func (h *Handler) handleApprove(s *discordgo.Session, i *discordgo.InteractionCr
 		},
 	}
 
-	// Send new message with ping to notify user
-	s.ChannelMessageSendComplex(i.ChannelID, &discordgo.MessageSend{
-		Content:    fmt.Sprintf("<@%s>", ticket.UserID),
+	// Send new message to notify user
+	msg, err := s.ChannelMessageSendComplex(i.ChannelID, &discordgo.MessageSend{
 		Flags:      discordgo.MessageFlagsIsComponentsV2,
 		Components: []discordgo.MessageComponent{container},
 	})
+	if err != nil {
+		log.Printf("handleApprove: failed to send approval message: %v", err)
+	} else {
+		log.Printf("handleApprove: approval message sent successfully, messageID=%s", msg.ID)
+	}
 
-	// Acknowledge the button click
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredMessageUpdate,
-	})
+	// For slash commands, send confirmation
+	if i.Type == discordgo.InteractionApplicationCommand {
+		h.respond(s, i, "✅ Ticket approved. User has been notified.", true)
+	}
 }
 
 func (h *Handler) handleDeny(s *discordgo.Session, i *discordgo.InteractionCreate) {
